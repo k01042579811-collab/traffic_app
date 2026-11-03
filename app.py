@@ -227,6 +227,20 @@ if temp_input <= 0 and surface in ["젖음/습기", "서리/결빙"]:
 
 risk_prob = min(100.0, base_risk_prob + weather_penalty)
 
+# [1번 요구사항 반영] 3단계 위험도 분류 로직 (안전 / 경고 / 위험)
+if risk_prob < 30.0:
+    risk_level_str = "🟢 안전"
+    risk_badge_color = "#28A745"
+    risk_desc_text = "교통사고 위험도가 비교적 낮은 구간입니다."
+elif risk_prob < 60.0:
+    risk_level_str = "🟡 경고"
+    risk_badge_color = "#FFC107"
+    risk_desc_text = "주의 운전 및 시설 점검이 필요한 주의 구간입니다."
+else:
+    risk_level_str = "🔴 위험"
+    risk_badge_color = "#DC3545"
+    risk_desc_text = "사고 다발 및 고위험 구간입니다! 특별 안전 대책이 필요합니다."
+
 # 메인 탭 구획 (5개 탭)
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🚨 AI 위험도 예측 및 진단", 
@@ -241,43 +255,35 @@ with tab1:
     col1, col2 = st.columns([1, 1.2])
     
     with col1:
-        st.subheader("🎯 예측 위험도 (중상 이상 확률)")
-        fig_gauge = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=risk_prob,
-            number={'suffix': "%", 'font': {'size': 38}},
-            gauge={
-                'axis': {'range': [0, 100]},
-                'bar': {'color': "#1F4E79"},
-                'steps': [
-                    {'range': [0, 21.9], 'color': "#E2EFDA"},
-                    {'range': [21.9, 40], 'color': "#FFF2CC"},
-                    {'range': [40, 100], 'color': "#FCE4D6"}
-                ],
-                'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': 21.9}
-            }
-        ))
-        fig_gauge.update_layout(height=280, margin=dict(l=20, r=20, t=30, b=20))
-        st.plotly_chart(fig_gauge, width='stretch')
+        st.subheader("🎯 예측 위험도 등급 (3단계)")
+        
+        # 직관적인 3단계 뱃지 및 상태 카드 출력
+        st.markdown(f"""
+        <div style="background-color: #F8F9FA; padding: 20px; border-radius: 10px; border: 2px solid {risk_badge_color}; text-align: center; margin-bottom: 15px;">
+            <h3 style="margin: 0; color: #333;">현재 구간 위험 등급</h3>
+            <h1 style="margin: 10px 0; color: {risk_badge_color};">{risk_level_str}</h1>
+            <p style="margin: 0; font-size: 14px; color: #666;">{risk_desc_text}</p>
+        </div>
+        """, unsafe_allow_html=True)
         
         if weather_penalty > 0:
             st.warning(f"⚠️ **기상 정밀 관측 보정 적용:** 시정거리({visibility_input}m) 및 기온({temp_input}°C) 영향으로 위험도 +{weather_penalty:.1f}%p 상승")
         else:
-            st.info("💡 **강릉시 평균 중상 이상률:** 21.9% (빨간 선 기준)")
+            st.info("💡 **강릉시 평균 중상 이상률:** 21.9% 기준 정밀 산출")
 
     with col2:
         st.subheader("📋 '정리 - 분석 - 해석' 3단계 종합 진단")
-        fact_text = f"입력 조건 [{weather} | {surface} | {victim_type} | {victim_age} | 시정 {visibility_input}m] 기준 최종 치명 위험률은 **{risk_prob:.1f}%**입니다."
+        fact_text = f"입력 조건 [{weather} | {surface} | {victim_type} | {victim_age} | 시정 {visibility_input}m] 기준 최종 위험 등급은 **{risk_level_str}** 입니다."
         
-        if risk_prob >= 40:
-            analysis_text = "보행자/고령자/이륜차 및 악천후 시정 장애 특성이 반영된 **1사분면 최우선 관리(고위험) 수준**입니다."
+        if risk_prob >= 60.0:
+            analysis_text = "보행자/고령자/이륜차 및 악천후 시정 장애 특성이 반영된 **최우선 관리(고위험) 수준**입니다."
             action_text = "스마트 가변형 속도제어(VSL 30km/h 제한), 야간 보행자 투광등, 스마트 바닥신호등 및 안개 경고 시스템 투입이 시급합니다."
-        elif risk_prob >= 21.9:
+        elif risk_prob >= 30.0:
             analysis_text = "강릉시 평균 중증 위험도를 상회하며 기상 및 도로 여건에 따른 결합 위험성이 존재합니다."
             action_text = "감속 유도 표지판 추가 배치 및 악천후 시 도로 순찰 강화를 권장합니다."
         else:
-            analysis_text = "일반 차대차 사고 유형에 해당하며 치명 위험률은 낮으나 총량 관리가 필요한 구간입니다."
-            action_text = "교차로 정체 해소 및 회전교차로 전환 등 일반 교통 흐름 개선 사업 조치가 적합합니다."
+            analysis_text = "일반 차대차 사고 유형에 해당하며 치명 위험률은 낮으나 지속적인 총량 관리가 필요한 구간입니다."
+            action_text = "교차로 정체 해소 및 원활한 교통 흐름 개선 사업 조치가 적합합니다."
 
         st.markdown(f"""
         <div style="background-color: #F8F9FA; padding: 18px; border-radius: 8px; border-left: 6px solid #1F4E79;">
@@ -299,7 +305,7 @@ with tab1:
  - 피해자 연령대: {victim_age}
 
 ■ AI 예측 결과:
- - 최종 중상 이상 위험률: {risk_prob:.1f}% (기초 위험률: {base_risk_prob:.1f}%, 기상보정: +{weather_penalty:.1f}%p)
+ - 최종 위험 등급: {risk_level_str} (기초 확률: {base_risk_prob:.1f}%, 기상보정: +{weather_penalty:.1f}%p)
 
 ■ 3단계 종합 진단:
  1. 정리 (Fact): {fact_text}
