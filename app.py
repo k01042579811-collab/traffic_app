@@ -211,6 +211,161 @@ def special_accidents(df):
     return pd.DataFrame(rows)
 
 
+# ---------------------------------------------------------
+# 격자 계산 (좌표 원점을 고정해 조건이 바뀌어도 같은 격자를 사용)
+# ---------------------------------------------------------
+LAT0, LON0 = 37.75, 128.90
+
+
+def cell_ids(lat, lon, cell_m):
+    ix = np.floor((np.asarray(lon, dtype=float) - LON0) * 88000 / cell_m).astype(int)
+    iy = np.floor((np.asarray(lat, dtype=float) - LAT0) * 111000 / cell_m).astype(int)
+    return ix, iy
+
+
+def cell_center(ix, iy, cell_m):
+    return LAT0 + (np.asarray(iy) + 0.5) * cell_m / 111000, LON0 + (np.asarray(ix) + 0.5) * cell_m / 88000
+
+
+def cell_geojson(cells, cell_m):
+    feats = []
+    for ix, iy in cells:
+        corners = [(ix, iy), (ix + 1, iy), (ix + 1, iy + 1), (ix, iy + 1), (ix, iy)]
+        ring = [[LON0 + a * cell_m / 88000, LAT0 + b * cell_m / 111000] for a, b in corners]
+        feats.append({"type": "Feature", "id": f"{ix}_{iy}", "properties": {},
+                      "geometry": {"type": "Polygon", "coordinates": [ring]}})
+    return {"type": "FeatureCollection", "features": feats}
+
+
+def cell_counts(df_xy, cell_m):
+    ix, iy = cell_ids(df_xy['lat'], df_xy['lon'], cell_m)
+    return pd.DataFrame({'ix': ix, 'iy': iy}).groupby(['ix', 'iy']).size().rename('c').reset_index()
+
+
+def abs_reference(df_xy, cell_m):
+    """기상×주야 모든 조합 중 한 격자에 쌓인 최대 사고 건수 (조건 간 같은 색 범위를 쓰기 위한 기준)"""
+    ix, iy = cell_ids(df_xy['lat'], df_xy['lon'], cell_m)
+    t = pd.DataFrame({'w': df_xy['기상상태'].values, 'd': df_xy['주야'].values, 'ix': ix, 'iy': iy})
+    return int(t.groupby(['w', 'd', 'ix', 'iy']).size().max())
+
+
+def risk_grid(df_all, cell_m, a=3.0):
+    """격자별 사고 이력과 지점 보정배수(RR).
+    같은 구성(차종·연령·도로형태 등)의 사고라면 기대되는 중상 이상 건수(E)와 실제(O)를 비교해
+    구성 차이를 제거한 뒤 지점 효과만 남기고, 소표본은 a건만큼 평균(1.0)쪽으로 당겨 보정한다."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import OneHotEncoder
+    cols = [f[1] for f in FACTORS]
+    d = df_all[df_all['피해운전자 상해정도'].isin(VALID_OUT) & df_all[cols].notna().all(axis=1)].copy()
+    y = d['피해운전자 상해정도'].isin(SEVERE).astype(int)
+    enc = OneHotEncoder(handle_unknown='ignore').fit(d[cols].astype(str))
+    lr = LogisticRegression(C=0.5, max_iter=1000).fit(enc.transform(d[cols].astype(str)), y)
+    d['E'] = lr.predict_proba(enc.transform(d[cols].astype(str)))[:, 1]
+    d['O'] = y
+    d['lat'] = pd.to_numeric(d['경도'], errors='coerce')
+    d['lon'] = pd.to_numeric(d['위도'], errors='coerce')
+    d = d.dropna(subset=['lat', 'lon'])
+    d = d[d['lat'].between(37.5, 38.0) & d['lon'].between(128.5, 129.2)]
+    d['ix'], d['iy'] = cell_ids(d['lat'], d['lon'], cell_m)
+    g = d.groupby(['ix', 'iy']).agg(n=('O', 'size'), O=('O', 'sum'), E=('E', 'sum'),
+                                    road=('도로형태', lambda s: s.mode().iat[0]),
+                                    acc=('사고유형', lambda s: s.mode().iat[0])).reset_index()
+    g['rr'] = ((g['O'] + a) / (g['E'] + a)).clip(0.2, 5)
+    return g
+
+
+def adjust_risk(p_pct, rr):
+    """선택 조건의 AI 위험도(%)에 지점 보정배수를 오즈에 곱해 반영"""
+    p = min(max(p_pct / 100.0, 0.001), 0.999)
+    odds = p / (1 - p) * np.asarray(rr, dtype=float)
+    return odds / (1 + odds) * 100
+
+
+# ---------------------------------------------------------
+# 사고 요인 연계 관계도 (연구 단계 분석 방법과 동일: 표준화잔차, Lift, 건수 기준)
+# ---------------------------------------------------------
+NET_VARS = [('가해차종', '가해운전자 차종'), ('가해성별', '가해운전자 성별'), ('가해연령', '가해운전자 연령대'),
+            ('피해차종', '피해운전자 차종'), ('피해성별', '피해운전자 성별'), ('피해연령', '피해운전자 연령대')]
+NET_COLORS = {'가해차종': '#C4432E', '가해성별': '#E8892B', '가해연령': '#D9B21F',
+              '피해차종': '#0F5C6E', '피해성별': '#2F8F6B', '피해연령': '#7C5CFA'}
+_CAR = {'개인형이동수단(PM)': 'PM', '건설기계': '기타', '특수': '기타', '농기계': '기타', '사륜오토바이(ATV)': '기타', '기타불명': '기타'}
+_AGE = {'12세 이하': '20세 이하', '13-20세': '20세 이하', '기타불명': np.nan}
+
+
+def net_value(var, v):
+    """사이드바 선택 값을 관계도 범주명으로 변환"""
+    if var.endswith('차종'):
+        return _CAR.get(v, v)
+    if var.endswith('연령'):
+        return _AGE.get(v, v)
+    return v
+
+
+def net_prepare(df):
+    d = df[df['피해운전자 차종'].notna()].copy()          # 단독사고 제외
+    out = pd.DataFrame(index=d.index)
+    for name, col in NET_VARS:
+        s = d[col]
+        if name.endswith('차종'):
+            s = s.map(lambda x: _CAR.get(x, x))
+        elif name.endswith('연령'):
+            s = s.map(lambda x: _AGE.get(x, x))
+        else:
+            s = s.replace('기타불명', np.nan)
+        out[name] = s
+    out['중상'] = d['피해운전자 상해정도'].map(lambda x: np.nan if x not in VALID_OUT else float(x in SEVERE))
+    return out
+
+
+def build_network(df, sr_min=2.5, lift_min=1.3, n_min=8):
+    d = net_prepare(df)
+    names = [n for n, _ in NET_VARS]
+    edges = []
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            a, b = names[i], names[j]
+            ct = pd.crosstab(d[a], d[b])
+            tot = ct.values.sum()
+            exp = np.outer(ct.sum(axis=1), ct.sum(axis=0)) / tot
+            sr = (ct.values - exp) / np.sqrt(exp)
+            lift = ct.values / exp
+            for r, ra in enumerate(ct.index):
+                for c, cb in enumerate(ct.columns):
+                    if sr[r, c] >= sr_min and lift[r, c] >= lift_min and ct.values[r, c] >= n_min:
+                        edges.append({'a': f'{a}:{ra}', 'b': f'{b}:{cb}', 'n': int(ct.values[r, c]),
+                                      'lift': float(lift[r, c]), 'sr': float(sr[r, c])})
+    edges = pd.DataFrame(edges, columns=['a', 'b', 'n', 'lift', 'sr'])
+    rows = []
+    for name in names:
+        for cat, g in d.groupby(name):
+            v = g['중상'].dropna()
+            rows.append({'id': f'{name}:{cat}', 'var': name, 'cat': cat, 'n': len(g),
+                         'rate': float(v.mean() * 100) if len(v) else np.nan, 'm': len(v)})
+    nodes = pd.DataFrame(rows)
+    ang = -np.pi / 2 + 2 * np.pi * np.arange(len(nodes)) / len(nodes)
+    nodes['x'], nodes['y'], nodes['ang'] = np.cos(ang), np.sin(ang), ang
+    return nodes, edges, len(d)
+
+
+def facility_audit(acc, fac_dfs, items, radius=300):
+    """선택한 사고 지점들 기준 시설물 감사: (설치율%, 반경 내 개수(합집합), 전체 개수)"""
+    from scipy.spatial import cKDTree
+    lat0, lon0 = acc['lat'].mean(), acc['lon'].mean()
+    axy = np.column_stack([(acc['lon'] - lon0) * 88000, (acc['lat'] - lat0) * 111000])
+    tree_a = cKDTree(axy)
+    res = {}
+    for it in items:
+        f = fac_dfs.get(it)
+        if f is None or len(f) == 0:
+            res[it] = (0.0, 0, 0)
+            continue
+        fxy = np.column_stack([(f['lon'] - lon0) * 88000, (f['lat'] - lat0) * 111000])
+        d_acc, _ = cKDTree(fxy).query(axy)
+        d_fac, _ = tree_a.query(fxy)
+        res[it] = (float((d_acc <= radius).mean() * 100), int((d_fac <= radius).sum()), int(len(f)))
+    return res
+
+
 import re
 
 # ---------------------------------------------------------
@@ -295,6 +450,12 @@ def build_quad(df):
 df_all = load_all_data()
 df_special = cached_special(df_all)
 quad_data, quad_median, base_rate = build_quad(df_all)
+
+
+@st.cache_data
+def cached_network():
+    return build_network(df_all)
+
 n_valid = int(df_all['피해운전자 상해정도'].isin(VALID_OUT).sum())
 
 
@@ -349,6 +510,7 @@ section[data-testid="stSidebar"] h2 { font-size: 1rem; font-weight: 650; }
 .chip { font-style: normal; font-size: .78rem; padding: .1rem .55rem; border-radius: 999px; margin-left: .5rem; }
 .chip.ok { background: rgba(47,143,107,.16); color: #2F8F6B; }
 .chip.warn { background: rgba(196,67,46,.16); color: #C4432E; }
+.chip.mid { background: rgba(217,150,43,.18); color: #C98A1F; }
 </style>
 """)
 
@@ -463,8 +625,8 @@ html('<div class="conds">' + "".join([
     chip("🌡️", "기온", f"{temp_input}°C"),
 ]) + '</div>')
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "위험도 예측·진단", "사고 핫스팟 지도", "반경 300m 시설물 감사", "4사분면 분석", "취약 유형별 추이"
+tab1, tab2, tab_risk, tab3, tab4, tab5 = st.tabs([
+    "위험도 예측·진단", "사고 핫스팟 지도", "구간 위험도 지도", "영역 시설물 감사", "4사분면 분석", "취약 유형별 추이"
 ])
 
 # --- TAB 1: AI 위험도 예측 ---
@@ -574,7 +736,46 @@ with tab1:
         mime="text/plain", width='stretch'
     )
 
-# --- TAB 2: 지도 시각화 ---
+# --- TAB 2: 사고 핫스팟 지도 ---
+NORMS = ["절대 건수 (조건 간 비교)", "조건 내 상대 (최대=100%)", "지점별 조건 비중"]
+HEAT_SCALE = [[0, "#FFF1D0"], [0.3, "#F6C667"], [0.65, "#E8742B"], [1, "#A92E22"]]
+new_api = hasattr(go, 'Scattermap')
+Sc = go.Scattermap if new_api else go.Scattermapbox
+Choro = go.Choroplethmap if new_api else go.Choroplethmapbox
+lay = 'map' if new_api else 'mapbox'
+legend_box = dict(orientation="h", y=0.01, x=0.01, bgcolor="rgba(255,255,255,.88)", font=dict(color="#1B2A33"))
+
+
+def add_facilities(fig, names):
+    for i, name in enumerate(names):
+        f = facility_dfs[name]
+        fig.add_trace(Sc(lat=f['lat'], lon=f['lon'], mode='markers', hoverinfo='text', text=name,
+                         marker=dict(size=6, color=FAC_COLORS[i % len(FAC_COLORS)], opacity=0.85),
+                         name=f"{name} ({len(f):,}개소)"))
+
+
+def grid_figure(cells, values, cell_m, colorscale, zmin, zmax, cbar, customdata, hover, center):
+    """격자(사각형) 단위로 값을 칠한 지도를 만든다"""
+    geo = cell_geojson(zip(cells['ix'], cells['iy']), cell_m)
+    ids = [f"{a}_{b}" for a, b in zip(cells['ix'], cells['iy'])]
+    fig = go.Figure(Choro(
+        geojson=geo, locations=ids, z=values, colorscale=colorscale, zmin=zmin, zmax=zmax,
+        marker=dict(opacity=0.72, line=dict(width=0.4, color="rgba(255,255,255,.7)")),
+        colorbar=dict(title=cbar, thickness=12), customdata=customdata, hovertemplate=hover))
+    fig.update_layout(**{lay: dict(style=MAP_STYLE, center=dict(lat=center[0], lon=center[1]), zoom=11.5)}, height=520)
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def cached_abs_ref(cell_m):
+    return abs_reference(df_raw[['기상상태', '주야', 'lat', 'lon']], cell_m)
+
+
+@st.cache_data(show_spinner=False)
+def cached_risk_grid(cell_m):
+    return risk_grid(df_all, cell_m)
+
+
 with tab2:
     st.subheader("강릉시 사고 핫스팟과 도로시설물 레이어")
     filtered_df = df_raw[(df_raw['기상상태'] == weather) & (df_raw['주야'] == day_night)].copy()
@@ -588,41 +789,58 @@ with tab2:
     with col_fac2:
         selected_facs = st.multiselect("겹쳐 볼 도로시설물 (여러 개 선택 가능, ✕로 바로 해제)", list(facility_dfs.keys()),
                                        placeholder="시설물을 선택하세요")
-        map_style = st.radio("표시 방식", ["밀집도 히트맵 (Heatmap)", "개별 사고점 (Scatter)"], horizontal=True, key="map_toggle")
+        map_mode = st.radio("표시 방식", ["개별 사고점", "격자 히트맵", "부드러운 히트맵"], horizontal=True, key="map_mode")
+
+    cell_m, norm, min_share = 500, NORMS[0], 5
+    if map_mode == "격자 히트맵":
+        g1, g2, g3 = st.columns(3)
+        with g1:
+            cell_m = st.select_slider("격자 크기", options=[250, 500, 1000], value=500, format_func=lambda m: f"{m}m", key="hm_cell")
+        with g2:
+            norm = st.selectbox("색상 기준(표준화)", NORMS, key="hm_norm")
+        if norm == NORMS[2]:
+            with g3:
+                min_share = st.slider("비중 계산 최소 사고 수", 3, 15, 5, key="hm_minn")
 
     if len(filtered_df) > 0:
-        center_lat = filtered_df['lat'].mean()
-        center_lon = filtered_df['lon'].mean()
-        new_api = hasattr(go, 'Scattermap')
-        Sc = go.Scattermap if new_api else go.Scattermapbox
-        lay = 'map' if new_api else 'mapbox'
-        legend_box = dict(orientation="h", y=0.01, x=0.01, bgcolor="rgba(255,255,255,.88)", font=dict(color="#1B2A33"))
+        center = (filtered_df['lat'].mean(), filtered_df['lon'].mean())
 
-        def add_facilities(fig):
-            for i, name in enumerate(selected_facs):
-                f = facility_dfs[name]
-                fig.add_trace(Sc(lat=f['lat'], lon=f['lon'], mode='markers', hoverinfo='text', text=name,
-                                 marker=dict(size=6, color=FAC_COLORS[i % len(FAC_COLORS)], opacity=0.85),
-                                 name=f"{name} ({len(f):,}개소)"))
-
-        if map_style == "밀집도 히트맵 (Heatmap)":
-            filtered_df['사고건수'] = 1
-            heat_scale = [[0, "rgba(217,150,43,0)"], [0.35, "#D9962B"], [1, HIGH]]
-            if hasattr(px, 'density_map'):
-                fig_map = px.density_map(
-                    filtered_df, lat="lat", lon="lon", z="사고건수", radius=25,
-                    center=dict(lat=center_lat, lon=center_lon), zoom=11.5,
-                    map_style=MAP_STYLE, color_continuous_scale=heat_scale, opacity=0.85, height=520)
+        if map_mode == "격자 히트맵":
+            cond = cell_counts(filtered_df, cell_m)
+            allc = cell_counts(df_raw, cell_m).rename(columns={'c': 'all'})
+            cond = cond.merge(allc, on=['ix', 'iy'], how='left')
+            if norm == NORMS[0]:
+                zmax, cbar, cond['z'] = cached_abs_ref(cell_m), "사고 건수", cond['c']
+                note = f"모든 조건에서 같은 색 범위(0~{zmax}건)를 씁니다. 조건끼리 비교할 때 사용하세요."
+            elif norm == NORMS[1]:
+                zmax, cbar, cond['z'] = 100, "조건 내 상대(%)", cond['c'] / cond['c'].max() * 100
+                note = "현재 조건에서 가장 많은 격자를 100%로 맞춥니다. 조건 안에서 핫스팟 위치를 볼 때 사용하세요."
             else:
-                fig_map = px.density_mapbox(
-                    filtered_df, lat="lat", lon="lon", z="사고건수", radius=25,
-                    center=dict(lat=center_lat, lon=center_lon), zoom=11.5,
-                    mapbox_style=MAP_STYLE, color_continuous_scale=heat_scale, opacity=0.85, height=520)
-            add_facilities(fig_map)
+                cond = cond[cond['all'] >= min_share].copy()
+                cond['z'] = cond['c'] / cond['all'] * 100
+                zmax, cbar = (max(float(cond['z'].max()), 1.0) if not cond.empty else 100), "지점 내 조건 비중(%)"
+                note = f"각 격자의 전체 사고 중 현재 조건({weather}·{day_night})의 비중입니다. 지도 전체 평균은 {len(filtered_df) / len(df_raw):.0%}이며, 사고 {min_share}건 미만 격자는 제외했습니다."
+            if cond.empty:
+                st.warning("기준을 만족하는 격자가 없습니다. 최소 사고 수를 낮추거나 격자 크기를 키워 보세요.")
+                fig_map = None
+            else:
+                fig_map = grid_figure(cond, cond['z'], cell_m, HEAT_SCALE, 0, zmax, cbar,
+                                      cond[['c', 'all']].values,
+                                      "%{z:.1f}<br>조건 일치 %{customdata[0]}건 / 지점 전체 %{customdata[1]}건<extra></extra>", center)
+                st.caption(note)
+        elif map_mode == "부드러운 히트맵":
+            filtered_df['사고건수'] = 1
+            scale = [[0, "rgba(217,150,43,0)"], [0.35, "#D9962B"], [1, HIGH]]
+            if hasattr(px, 'density_map'):
+                fig_map = px.density_map(filtered_df, lat="lat", lon="lon", z="사고건수", radius=25, center=dict(lat=center[0], lon=center[1]),
+                                         zoom=11.5, map_style=MAP_STYLE, color_continuous_scale=scale, opacity=0.85, height=520)
+            else:
+                fig_map = px.density_mapbox(filtered_df, lat="lat", lon="lon", z="사고건수", radius=25, center=dict(lat=center[0], lon=center[1]),
+                                            zoom=11.5, mapbox_style=MAP_STYLE, color_continuous_scale=scale, opacity=0.85, height=520)
+            st.caption("색은 현재 조건 안에서의 상대 밀집도입니다. 조건끼리 비교하려면 '격자 히트맵'의 절대 건수 기준을 사용하세요.")
         else:
             fig_map = go.Figure()
-            add_facilities(fig_map)   # 시설물을 먼저 그려 사고점이 위에 보이도록 함
-            # 사고점: 흰 테두리 + 심각도별 크기·색 (시설물의 작은 점과 모양으로 구분)
+            add_facilities(fig_map, selected_facs)   # 시설물을 먼저 그려 사고점이 위에 보이도록 함
             fig_map.add_trace(Sc(
                 lat=filtered_df['lat'], lon=filtered_df['lon'], mode='markers', hoverinfo='skip', showlegend=False,
                 marker=dict(size=[SEV_SIZE.get(x, 9) + 5 for x in filtered_df['사고내용']], color="white", opacity=0.95)))
@@ -635,64 +853,175 @@ with tab2:
                     marker=dict(size=SEV_SIZE[sev], color=SEVERITY[sev], opacity=0.95),
                     text=sub['사고유형'], customdata=sub[['법규위반', '피해운전자 차종']].astype(str).values,
                     hovertemplate="%{text}<br>법규위반: %{customdata[0]}<br>피해 차종: %{customdata[1]}<extra>" + sev + "</extra>"))
-            fig_map.update_layout(**{lay: dict(style=MAP_STYLE, center=dict(lat=center_lat, lon=center_lon), zoom=11.5)}, height=520)
-
-        fig_map.update_layout(margin={"r": 0, "t": 0, "l": 0, "b": 0}, font=dict(family=FONT), legend=legend_box)
-        st.plotly_chart(fig_map, width='stretch')
-        if map_style != "밀집도 히트맵 (Heatmap)":
+            fig_map.update_layout(**{lay: dict(style=MAP_STYLE, center=dict(lat=center[0], lon=center[1]), zoom=11.5)}, height=520)
             st.caption("사고점은 흰 테두리가 있는 큰 점(크기·색은 심각도), 시설물은 테두리 없는 작은 점입니다.")
+
+        if fig_map is not None:
+            if map_mode != "개별 사고점":
+                add_facilities(fig_map, selected_facs)
+            fig_map.update_layout(margin={"r": 0, "t": 0, "l": 0, "b": 0}, font=dict(family=FONT), legend=legend_box)
+            st.plotly_chart(fig_map, width='stretch')
     else:
         st.warning("선택한 조건에 해당하는 사고 지점이 없습니다. 기상 상태나 주야 구분을 바꿔 보세요.")
 
-# --- TAB 3: 반경 300m 도로안전 시설물 감사 ---
-with tab3:
-    st.subheader("사고 중심 반경 300m 도로안전 시설물 감사")
-    st.caption("선택한 기상·주야 조건 사고 지점의 평균 좌표를 중심으로 계산합니다. 지도에서 영역을 직접 지정하는 방식은 다음 단계에서 추가됩니다.")
+# --- TAB: 구간 위험도 지도 ---
+with tab_risk:
+    st.subheader("구간 위험도 지도")
+    st.caption("선택한 조건의 AI 위험도에, 격자별 과거 사고 경향(같은 구성의 사고와 비교한 보정배수, 소표본은 평균 쪽으로 보정)을 반영한 추정치입니다. 교통량·속도 정보가 없어 도로 한 줄 단위의 실시간 위험은 아닙니다.")
+    rk1, rk2, rk3 = st.columns(3)
+    with rk1:
+        layer = st.radio("지도 층", ["조건 반영 위험도", "중상 이상 사고 이력"], key="rk_layer")
+    with rk2:
+        cell_r = st.select_slider("격자 크기", options=[250, 500, 1000], value=500, format_func=lambda m: f"{m}m", key="rk_cell")
+    with rk3:
+        min_n = st.slider("최소 사고 수 (미만 격자는 제외)", 3, 15, 5, key="rk_minn")
 
-    filtered_df = df_raw[(df_raw['기상상태'] == weather) & (df_raw['주야'] == day_night)].copy()
+    if layer == "조건 반영 위험도":
+        grid = cached_risk_grid(cell_r)
+        elig = grid[grid['n'] >= min_n].copy()
+        if elig.empty:
+            st.info("기준을 만족하는 격자가 없습니다. 최소 사고 수를 낮추거나 격자 크기를 키워 보세요.")
+        else:
+            elig['risk'] = adjust_risk(risk_prob, elig['rr'])
+            lo, hi = float(elig['risk'].min()), float(elig['risk'].max())
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("선택 조건 위험도", f"{risk_prob:.1f}% · {grade}")
+            m2.metric("격자 간 위험도 범위", f"{lo:.1f}~{hi:.1f}%")
+            m3.metric("지점 보정배수 범위", f"×{elig['rr'].min():.2f}~{elig['rr'].max():.2f}")
+            m4.metric("표시/제외 격자", f"{len(elig)} / {len(grid) - len(elig)}")
+            zoom_in = st.checkbox("격자 간 차이 강조 (색 범위를 현재 값 범위에 맞춤)", value=True, key="rk_zoom")
+            zmin, zmax = (lo, hi if hi > lo else lo + 1) if zoom_in else (0, 60)
+            clat, clon = cell_center(elig['ix'], elig['iy'], cell_r)
+            elig['중심 위도'], elig['중심 경도'] = clat, clon
+            fig_r = grid_figure(
+                elig, elig['risk'], cell_r, [[0, "#E7F2EC"], [0.5, "#F3C87A"], [1, "#C4432E"]], zmin, zmax, "위험도(%)",
+                elig[['n', 'O', 'rr']].values,
+                "위험도 %{z:.1f}%<br>과거 사고 %{customdata[0]}건 (중상 이상 %{customdata[1]}건)<br>지점 보정 ×%{customdata[2]:.2f}<extra></extra>",
+                (float(clat.mean()), float(clon.mean())))
+            fig_r.update_layout(margin={"r": 0, "t": 0, "l": 0, "b": 0}, font=dict(family=FONT))
+            st.plotly_chart(fig_r, width='stretch')
+            st.caption("참고 기준: 안전 21.9% 미만 · 주의 40% 미만 · 위험 40% 이상. 격자 간 차이는 조건 자체의 영향보다 작으므로, 색 범위를 강조한 지도는 상대 비교용으로만 보세요.")
 
-    if len(filtered_df) > 0 and len(facility_dfs) > 0:
-        c_lat = filtered_df['lat'].mean()
-        c_lon = filtered_df['lon'].mean()
-
-        audit_results = {}
-        for fac_name, df_fac in facility_dfs.items():
-            if not df_fac.empty:
-                d_lat = (df_fac['lat'] - c_lat) * 111000
-                d_lon = (df_fac['lon'] - c_lon) * 88000
-                audit_results[fac_name] = int((np.sqrt(d_lat**2 + d_lon**2) <= 300).sum())
-            else:
-                audit_results[fac_name] = 0
-
-        df_audit = pd.DataFrame(list(audit_results.items()), columns=["도로시설물", "반경 300m 내 개수"])
-        df_audit["구분"] = np.where(df_audit["도로시설물"].isin(KEY_ITEMS), "핵심 6종", "그 외")
-
-        col_au1, col_au2 = st.columns([1.2, 1])
-        with col_au1:
-            fig_audit = px.bar(
-                df_audit, x="반경 300m 내 개수", y="도로시설물", orientation="h", color="구분",
-                color_discrete_map={"핵심 6종": SEA, "그 외": SEA_SOFT}, title="주변 도로시설물 설치 현황 (개소)")
-            fig_audit.update_yaxes(categoryorder="total ascending", title_text="")
-            st.plotly_chart(style_fig(fig_audit, 480), width='stretch')
-
-        with col_au2:
-            st.subheader("안전시설 공백 진단")
-            st.caption(f"분석 기준점(사고 지점 평균): 위도 {c_lat:.4f}, 경도 {c_lon:.4f}")
-            rows = ""
-            for item in KEY_ITEMS:
-                cnt = audit_results.get(item, 0)
-                chip_html = '<i class="chip ok">확인</i>' if cnt > 0 else '<i class="chip warn">보완 필요</i>'
-                rows += f'<div class="row"><span>{item}</span><span><b>{cnt}</b>개{chip_html}</span></div>'
-            html(f'<div>{rows}</div>')
-
-            if audit_results.get('미끄럼방지시설', 0) == 0 and weather in ['비', '눈']:
-                st.warning("악천후 고위험 구간: 주변 300m 이내 미끄럼방지시설이 부족합니다.")
-            elif audit_results.get('보안등', 0) < 5 and day_night == '야간':
-                st.warning("야간 조명 취약 구간: 주변 보안등 추가 설치를 권장합니다.")
-            else:
-                st.success("기본 안전시설 배치가 확인되었습니다.")
+            top = elig.sort_values('risk', ascending=False).head(10).copy()
+            top['등급'] = np.where(top['risk'] >= CUT_HIGH, '위험', np.where(top['risk'] >= CUT_MID, '주의', '안전'))
+            show = pd.DataFrame({
+                '순위': range(1, len(top) + 1), '위험도(%)': top['risk'].round(1), '등급': top['등급'],
+                '과거 사고(건)': top['n'], '중상 이상(건)': top['O'], '지점 보정': top['rr'].round(2),
+                '주요 도로형태': top['road'], '주요 사고유형': top['acc'],
+                '중심 위도': top['중심 위도'].round(4), '중심 경도': top['중심 경도'].round(4)})
+            st.subheader("위험도 상위 격자")
+            st.dataframe(show, width='stretch', hide_index=True)
     else:
-        st.info("시설물 감사에 필요한 데이터를 준비 중입니다.")
+        sev_df = filtered_df[filtered_df['피해운전자 상해정도'].isin(SEVERE)]
+        st.caption(f"{weather}·{day_night} 조건에서 피해운전자가 중상 이상이었던 사고의 위치입니다(좌표가 있는 사고만).")
+        if sev_df.empty:
+            st.info("이 조건에는 좌표가 확인된 중상 이상 사고가 없습니다.")
+        else:
+            sc = cell_counts(sev_df, cell_r)
+            sc = sc[sc['c'] >= 1]
+            ac = cell_counts(filtered_df, cell_r).rename(columns={'c': 'all'})
+            sc = sc.merge(ac, on=['ix', 'iy'], how='left')
+            m1, m2 = st.columns(2)
+            m1.metric("중상 이상 사고", f"{len(sev_df):,}건")
+            st.caption(f"{weather}·{day_night} 지도 표시 사고({len(filtered_df):,}건)의 {len(sev_df) / len(filtered_df):.0%}입니다.")
+            m2.metric("해당 격자 수", f"{len(sc)}개")
+            fig_s = grid_figure(sc, sc['c'], cell_r, [[0, "#FBE3D6"], [0.5, "#E8742B"], [1, "#7A1212"]], 0, max(int(sc['c'].max()), 1),
+                                "중상 이상(건)", sc[['c', 'all']].values,
+                                "중상 이상 %{customdata[0]}건 / 조건 사고 %{customdata[1]}건<extra></extra>",
+                                (sev_df['lat'].mean(), sev_df['lon'].mean()))
+            fig_s.update_layout(margin={"r": 0, "t": 0, "l": 0, "b": 0}, font=dict(family=FONT))
+            st.plotly_chart(fig_s, width='stretch')
+
+
+# --- TAB 3: 영역 지정 시설물 감사 ---
+def selected_indices(ev):
+    """plotly 선택 이벤트에서 선택된 점의 위치를 안전하게 꺼낸다"""
+    try:
+        sel = ev["selection"] if isinstance(ev, dict) else ev.selection
+        pts = sel["point_indices"] if isinstance(sel, dict) else sel.point_indices
+        return [int(i) for i in pts]
+    except Exception:
+        return []
+
+
+with tab3:
+    st.subheader("지도에서 영역을 지정한 시설물 감사")
+    st.caption("지도 오른쪽 위 도구 모음에서 사각형(Box) 또는 올가미(Lasso) 선택을 누르고, 감사할 사고 지점을 드래그해 지정하세요. 선택한 사고 지점마다 반경 300m의 도로시설물을 확인합니다.")
+    au1, au2 = st.columns([2, 1])
+    with au1:
+        use_cond = st.checkbox(f"현재 조건({weather}·{day_night})의 사고만 표시", value=True, key="au_cond")
+    with au2:
+        manual = st.checkbox("좌표로 직접 지정", value=False, key="au_manual", help="지도 선택이 동작하지 않을 때 사용합니다.")
+
+    acc = (df_raw[(df_raw['기상상태'] == weather) & (df_raw['주야'] == day_night)] if use_cond else df_raw).reset_index(drop=True)
+    if acc.empty:
+        st.warning("표시할 사고 지점이 없습니다. 기상 상태나 주야 구분을 바꿔 보세요.")
+    else:
+        idx = []
+        if manual:
+            m1, m2, m3 = st.columns(3)
+            with m1:
+                mlat = st.number_input("중심 위도", value=float(acc['lat'].mean()), format="%.5f", key="au_lat")
+            with m2:
+                mlon = st.number_input("중심 경도", value=float(acc['lon'].mean()), format="%.5f", key="au_lon")
+            with m3:
+                mrad = st.slider("영역 반경 (m)", 100, 2000, 500, step=100, key="au_rad")
+            dist = np.sqrt(((acc['lat'] - mlat) * 111000) ** 2 + ((acc['lon'] - mlon) * 88000) ** 2)
+            idx = list(np.where(dist <= mrad)[0])
+        fig_a = go.Figure(Sc(
+            lat=acc['lat'], lon=acc['lon'], mode='markers', showlegend=False,
+            marker=dict(size=9, color=[SEVERITY.get(x, MUTED) for x in acc['사고내용']]),
+            selected=dict(marker=dict(opacity=1)), unselected=dict(marker=dict(opacity=0.3)),
+            text=acc['사고유형'], customdata=acc[['사고내용', '도로형태']].astype(str).values,
+            hovertemplate="%{text}<br>%{customdata[0]} · %{customdata[1]}<extra></extra>"))
+        fig_a.update_layout(**{lay: dict(style=MAP_STYLE, center=dict(lat=acc['lat'].mean(), lon=acc['lon'].mean()), zoom=11.5)},
+                            height=480, margin={"r": 0, "t": 0, "l": 0, "b": 0}, dragmode="select")
+        event = st.plotly_chart(fig_a, on_select="rerun", selection_mode=("box", "lasso"), key="audit_map", width='stretch')
+        if not manual:
+            idx = selected_indices(event)
+        idx = [i for i in idx if 0 <= i < len(acc)]
+
+        if not idx:
+            st.info("지도에서 사고 지점을 선택하면 감사 결과가 여기에 표시됩니다.")
+        elif not facility_dfs:
+            st.warning("시설물 데이터가 없어 감사를 수행할 수 없습니다.")
+        else:
+            sel = acc.iloc[idx]
+            audit = facility_audit(sel, facility_dfs, list(facility_dfs.keys()))
+            sev_n = int(sel['피해운전자 상해정도'].isin(SEVERE).sum())
+            c1, c2, c3 = st.columns(3)
+            c1.metric("선택한 사고", f"{len(sel):,}건")
+            c2.metric("중상 이상 사고", f"{sev_n:,}건")
+            c3.metric("주요 도로형태", sel['도로형태'].mode().iat[0])
+
+            col_a, col_b = st.columns([1.2, 1])
+            with col_a:
+                df_au = pd.DataFrame([{"도로시설물": k, "반경 300m 내 개수": v[1]} for k, v in audit.items()])
+                df_au["구분"] = np.where(df_au["도로시설물"].isin(KEY_ITEMS), "핵심 6종", "그 외")
+                fig_au = px.bar(df_au, x="반경 300m 내 개수", y="도로시설물", orientation="h", color="구분",
+                                color_discrete_map={"핵심 6종": SEA, "그 외": SEA_SOFT}, title="선택 영역 사고 지점 주변 시설물 (개소)")
+                fig_au.update_yaxes(categoryorder="total ascending", title_text="")
+                st.plotly_chart(style_fig(fig_au, 460), width='stretch')
+            with col_b:
+                st.subheader("안전시설 공백 진단")
+                st.caption("설치율 = 선택한 사고 지점 중 반경 300m 안에 해당 시설이 있는 비율")
+                rows = ""
+                for item in KEY_ITEMS:
+                    pct, cnt, tot = audit.get(item, (0.0, 0, 0))
+                    if cnt == 0:
+                        chip_html = '<i class="chip warn">보완 필요</i>'
+                    elif pct < 50:
+                        chip_html = '<i class="chip mid">일부 부족</i>'
+                    else:
+                        chip_html = '<i class="chip ok">확인</i>'
+                    rows += f'<div class="row"><span>{item}</span><span><b>{cnt}</b>개 · 설치율 {pct:.0f}%{chip_html}</span></div>'
+                html(f'<div>{rows}</div>')
+                slip, light = audit.get('미끄럼방지시설', (100, 1, 1)), audit.get('보안등', (100, 1, 1))
+                if weather in ('비', '눈') and slip[0] < 50:
+                    st.warning("악천후 조건에서 선택 영역의 미끄럼방지시설이 부족합니다.")
+                if day_night == '야간' and light[0] < 50:
+                    st.warning("야간 조건에서 선택 영역의 조명시설이 부족합니다.")
+                st.caption("시설의 존재 여부만 확인하며, 설치 수준의 적정성은 현장 점검이 필요합니다.")
 
 # --- TAB 4: 4사분면 분석 ---
 with tab4:
@@ -729,6 +1058,65 @@ with tab4:
         fig_imp.update_xaxes(visible=False)
         st.plotly_chart(style_fig(fig_imp, 440), width='stretch')
         st.caption(f"막대 길이 = 중요도, 색 = 현재 선택 값의 중상 이상률(초록 21.9% 미만 · 황 40% 미만 · 적 40% 이상). {imp_note}")
+
+    st.divider()
+    st.subheader("사고 요인 연계 관계도")
+    nodes, edges, n_net = cached_network()
+    pos = {r.id: r for r in nodes.itertuples()}
+    linked = {'피해차종': net_value('피해차종', victim_type), '피해연령': net_value('피해연령', victim_age)}
+    S = {f"{k}:{v}" for k, v in linked.items() if f"{k}:{v}" in pos}
+
+    st.caption(f"왼쪽 사이드바에서 고른 피해자 차종({linked['피해차종']})과 피해자 연령대({linked['피해연령']})가 자동으로 강조됩니다. 아래에서 다른 요인도 골라 연결을 탐색해 보세요.")
+    pc = st.columns(4)
+    for col, name in zip(pc, ['가해차종', '가해성별', '가해연령', '피해성별']):
+        cats = sorted(nodes.loc[nodes['var'] == name, 'cat'])
+        with col:
+            v = st.selectbox(name, ["(선택 안 함)"] + cats, key=f"net_{name}")
+        if v != "(선택 안 함)":
+            S.add(f"{name}:{v}")
+
+    def hi(e):
+        return (not S) or e.a in S or e.b in S
+
+    fig_net = go.Figure()
+    for e in edges.itertuples():
+        a, b = pos[e.a], pos[e.b]
+        on = hi(e)
+        fig_net.add_trace(go.Scatter(
+            x=[a.x, (a.x + b.x) / 2, b.x], y=[a.y, (a.y + b.y) / 2, b.y], mode='lines+markers', showlegend=False,
+            line=dict(width=(1 + e.sr / 2.2) * (1.0 if on else 0.6), color=HIGH if e.lift >= 2 else MUTED),
+            marker=dict(size=10, opacity=0), opacity=0.92 if on else 0.12, hoverinfo='text',
+            text=f"{e.a} ↔ {e.b}<br>사고 {e.n}건 · Lift {e.lift:.2f} · 표준화잔차 {e.sr:.1f}"))
+    mx = nodes['n'].max()
+    for name, g in nodes.groupby('var', sort=False):
+        chosen = g['id'].isin(S)
+        neighbor = g['id'].map(lambda i: any((e.a == i and e.b in S) or (e.b == i and e.a in S) for e in edges.itertuples()))
+        faded = bool(S) & ~(chosen | neighbor)
+        fig_net.add_trace(go.Scatter(
+            x=g['x'], y=g['y'], mode='markers+text', name=name,
+            text=g['cat'], textposition=["middle right" if x > 0.2 else "middle left" if x < -0.2 else ("top center" if y > 0 else "bottom center") for x, y in zip(g['x'], g['y'])],
+            textfont=dict(size=11), cliponaxis=False,
+            marker=dict(size=[10 + 16 * (n / mx) ** 0.5 + (8 if c else 0) for n, c in zip(g['n'], chosen)],
+                        color=NET_COLORS[name], opacity=[0.3 if f else 1 for f in faded],
+                        line=dict(width=[3 if c else 0 for c in chosen], color="#111827")),
+            customdata=[[n, "집계 없음" if r != r else f"{r:.1f}%"] for n, r in zip(g['n'], g['rate'])],
+            hovertemplate="%{text}<br>사고 %{customdata[0]}건 · 피해자 중상 이상률 %{customdata[1]}<extra>" + name + "</extra>"))
+    fig_net.update_layout(height=680, margin=dict(l=10, r=10, t=10, b=40), font=dict(family=FONT, size=12),
+                          legend=dict(orientation="h", y=-0.04), xaxis=dict(visible=False, range=[-1.6, 1.6]),
+                          yaxis=dict(visible=False, range=[-1.35, 1.35], scaleanchor="x"))
+    st.plotly_chart(fig_net, width='stretch')
+    st.caption(f"연구 단계 분석과 같은 기준(표준화잔차 2.5 이상, Lift 1.3 이상, 사고 8건 이상)으로 원본 {n_net:,}건에서 직접 계산했습니다. 선이 굵을수록 연계가 강하고, 빨간 선은 Lift 2 이상입니다. 연계는 인과관계를 뜻하지 않습니다.")
+
+    shown = edges[edges.apply(hi, axis=1)].sort_values('sr', ascending=False)
+    if S:
+        st.markdown(f"**선택한 요인과 연결된 조합 {len(shown)}개**")
+    if shown.empty:
+        st.info("선택한 요인과 기준을 만족하는 연결이 없습니다. 이 요인은 특정 요인과 두드러지게 함께 나타나지 않았다는 뜻입니다.")
+    else:
+        view = shown.head(12).rename(columns={'a': '요인 A', 'b': '요인 B', 'n': '사고(건)', 'lift': 'Lift', 'sr': '표준화잔차'})
+        view['Lift'], view['표준화잔차'] = view['Lift'].round(2), view['표준화잔차'].round(1)
+        st.dataframe(view, width='stretch', hide_index=True)
+
 
 # --- TAB 5: 취약 유형별 사고 추이 ---
 with tab5:
